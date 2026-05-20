@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,6 +26,7 @@ type options struct {
 	MemoryGBs          float64
 	CompartmentID      string
 	Quantity           int64
+	ConfigFile         string
 	AvailabilityDomain string
 	FaultDomain        string
 	DisplayName        string
@@ -31,7 +34,16 @@ type options struct {
 	ReservationCheck   time.Duration
 	Timeout            time.Duration
 	DryRun             bool
+	PreflightOnly      bool
+	SkipPreflight      bool
 	ResourceManagement string
+	Configs            []core.InstanceReservationConfigDetails
+}
+
+type configComparison struct {
+	RequestedTotal int64
+	ActualTotal    int64
+	Mismatches     []string
 }
 
 func main() {
@@ -64,6 +76,7 @@ func parseFlags(args []string) (options, error) {
 	fs.StringVar(&opts.CompartmentID, "compartment-id", "", "target compartment OCID")
 	fs.StringVar(&opts.CompartmentID, "compartment", "", "alias for --compartment-id")
 	fs.Int64Var(&opts.Quantity, "quantity", 0, "number of instances to reserve")
+	fs.StringVar(&opts.ConfigFile, "config-file", "", "JSON file containing one or more instanceReservationConfigs")
 	fs.StringVar(&opts.AvailabilityDomain, "availability-domain", "", "availability domain name, for example Uocm:US-ASHBURN-AD-1; defaults to the first AD in the tenancy")
 	fs.StringVar(&opts.FaultDomain, "fault-domain", "", "optional fault domain, for example FAULT-DOMAIN-1")
 	fs.StringVar(&opts.DisplayName, "display-name", "", "optional display name for the capacity reservation")
@@ -71,13 +84,15 @@ func parseFlags(args []string) (options, error) {
 	fs.DurationVar(&opts.ReservationCheck, "reservation-check-interval", 30*time.Second, "how often to check reserved quantity after a work request succeeds")
 	fs.DurationVar(&opts.Timeout, "timeout", 30*time.Minute, "maximum time to wait for the work request")
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "print the create request body and exit without calling OCI")
+	fs.BoolVar(&opts.PreflightOnly, "preflight-only", false, "check requested shapes against OCI and print the create request body without creating a reservation")
+	fs.BoolVar(&opts.SkipPreflight, "skip-preflight", false, "skip the OCI shape availability preflight before creating the reservation")
 	fs.StringVar(&opts.ResourceManagement, "resource-management", "", "optional internal shape resource management value: STATIC or DYNAMIC")
 
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: %s [flags]\n\n", os.Args[0])
 		fmt.Fprintln(fs.Output(), "Creates an OCI compute capacity reservation using ~/.oci/config DEFAULT profile, waits for the returned work request, and verifies the final reserved quantity.")
 		fmt.Fprintln(fs.Output(), "\nRequired flags:")
-		fmt.Fprintln(fs.Output(), "  --instance-type, --ocpus, --memory-gbs, --compartment-id, --quantity")
+		fmt.Fprintln(fs.Output(), "  --compartment-id plus either --config-file or all of --instance-type, --ocpus, --memory-gbs, --quantity")
 		fmt.Fprintln(fs.Output(), "\nExample:")
 		fmt.Fprintf(fs.Output(), "  %s --instance-type VM.Standard.E4.Flex --ocpus 4 --memory-gbs 64 --compartment-id ocid1.compartment.oc1..example --quantity 3 --availability-domain Uocm:US-ASHBURN-AD-1\n\n", os.Args[0])
 		fs.PrintDefaults()
@@ -87,20 +102,8 @@ func parseFlags(args []string) (options, error) {
 		return opts, err
 	}
 
-	if strings.TrimSpace(opts.Shape) == "" {
-		return opts, errors.New("--instance-type is required")
-	}
-	if opts.OCPUs <= 0 {
-		return opts, errors.New("--ocpus must be greater than 0")
-	}
-	if opts.MemoryGBs <= 0 {
-		return opts, errors.New("--memory-gbs must be greater than 0")
-	}
 	if strings.TrimSpace(opts.CompartmentID) == "" {
 		return opts, errors.New("--compartment-id is required")
-	}
-	if opts.Quantity <= 0 {
-		return opts, errors.New("--quantity must be greater than 0")
 	}
 	if opts.PollInterval <= 0 {
 		return opts, errors.New("--poll-interval must be greater than 0")
@@ -117,11 +120,43 @@ func parseFlags(args []string) (options, error) {
 	default:
 		return opts, errors.New("--resource-management must be STATIC or DYNAMIC when provided")
 	}
+
+	if strings.TrimSpace(opts.ConfigFile) != "" {
+		configs, err := loadInstanceReservationConfigs(opts.ConfigFile)
+		if err != nil {
+			return opts, err
+		}
+		if singleConfigFlagsProvided(opts) {
+			return opts, errors.New("--config-file cannot be combined with --instance-type, --ocpus, --memory-gbs, --quantity, --fault-domain, or --resource-management")
+		}
+		opts.Configs = configs
+	} else {
+		config, err := buildSingleInstanceReservationConfig(opts)
+		if err != nil {
+			return opts, err
+		}
+		opts.Configs = []core.InstanceReservationConfigDetails{config}
+	}
+
+	if err := validateInstanceReservationConfigs(opts.Configs); err != nil {
+		return opts, err
+	}
+	opts.Quantity = requestedConfigTotal(opts.Configs)
+
 	if opts.DisplayName == "" {
-		opts.DisplayName = defaultDisplayName(opts.Shape)
+		opts.DisplayName = defaultDisplayName(opts.Configs)
 	}
 
 	return opts, nil
+}
+
+func singleConfigFlagsProvided(opts options) bool {
+	return strings.TrimSpace(opts.Shape) != "" ||
+		opts.OCPUs != 0 ||
+		opts.MemoryGBs != 0 ||
+		opts.Quantity != 0 ||
+		strings.TrimSpace(opts.FaultDomain) != "" ||
+		strings.TrimSpace(opts.ResourceManagement) != ""
 }
 
 func run(parent context.Context, opts options) error {
@@ -139,6 +174,9 @@ func run(parent context.Context, opts options) error {
 	if err != nil {
 		return err
 	}
+	if err := validateAvailabilityDomainRegion(region, availabilityDomain); err != nil {
+		return err
+	}
 
 	if opts.DryRun {
 		return printDryRunPayload(opts, availabilityDomain)
@@ -148,6 +186,28 @@ func run(parent context.Context, opts options) error {
 	if err != nil {
 		return fmt.Errorf("create compute client: %w", err)
 	}
+
+	preflightRan := false
+	if !opts.SkipPreflight {
+		var err error
+		preflightRan, err = preflightRequestedShapes(ctx, computeClient, opts, availabilityDomain)
+		if err != nil {
+			return err
+		}
+	} else {
+		fmt.Println("Shape preflight skipped")
+	}
+	if opts.PreflightOnly {
+		if preflightRan {
+			fmt.Println("Preflight passed; OCI create call was not sent.")
+		} else if opts.SkipPreflight {
+			fmt.Println("Preflight skipped; OCI create call was not sent.")
+		} else {
+			fmt.Println("Preflight could not be completed; OCI create call was not sent.")
+		}
+		return printCreatePayload(opts, availabilityDomain)
+	}
+
 	workRequestClient, err := workrequests.NewWorkRequestClientWithConfigurationProvider(provider)
 	if err != nil {
 		return fmt.Errorf("create work request client: %w", err)
@@ -156,7 +216,7 @@ func run(parent context.Context, opts options) error {
 	fmt.Printf("Creating capacity reservation %q in region %s, availability domain %s\n", opts.DisplayName, region, availabilityDomain)
 	createResp, err := createCapacityReservation(ctx, computeClient, opts, availabilityDomain)
 	if err != nil {
-		return fmt.Errorf("create capacity reservation: %w", err)
+		return createCapacityReservationError(err, opts, availabilityDomain)
 	}
 
 	reservationID := value(createResp.ComputeCapacityReservation.Id)
@@ -201,14 +261,157 @@ func updateCapacityReservation(ctx context.Context, client core.ComputeClient, o
 		CapacityReservationId: common.String(reservationID),
 		IfMatch:               etag,
 		UpdateComputeCapacityReservationDetails: core.UpdateComputeCapacityReservationDetails{
-			InstanceReservationConfigs: []core.InstanceReservationConfigDetails{buildInstanceReservationConfig(opts)},
+			InstanceReservationConfigs: opts.Configs,
 		},
 	})
 }
 
-func buildCreateDetails(opts options, availabilityDomain string) core.CreateComputeCapacityReservationDetails {
-	config := buildInstanceReservationConfig(opts)
+func preflightRequestedShapes(ctx context.Context, client core.ComputeClient, opts options, availabilityDomain string) (bool, error) {
+	available, err := listAvailableReservationShapes(ctx, client, opts.CompartmentID, availabilityDomain)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: unable to preflight capacity reservation shapes; continuing with create: %v\n", err)
+		return false, nil
+	}
 
+	requested := requestedShapes(opts.Configs)
+	var missing []string
+	for shape := range requested {
+		if !available[shape] {
+			missing = append(missing, shape)
+		}
+	}
+	if len(missing) == 0 {
+		fmt.Printf("Shape preflight passed for %d requested shape(s)\n", len(requested))
+		return true, nil
+	}
+
+	sort.Strings(missing)
+	availableList := sortedStringKeys(available)
+	return true, fmt.Errorf(
+		"requested shape(s) are not available for compute capacity reservations in compartment %s, availability domain %s: %s. Available shapes: %s%s",
+		opts.CompartmentID,
+		availabilityDomain,
+		strings.Join(missing, ", "),
+		strings.Join(availableList, ", "),
+		shapePreflightHint(opts),
+	)
+}
+
+func createCapacityReservationError(err error, opts options, availabilityDomain string) error {
+	serviceErr, ok := common.IsServiceError(err)
+	if !ok || serviceErr.GetHTTPStatusCode() != 404 || !strings.EqualFold(serviceErr.GetCode(), "NotAuthorizedOrNotFound") {
+		return fmt.Errorf("create capacity reservation: %w", err)
+	}
+
+	return fmt.Errorf(
+		"create capacity reservation: %w\nrequested configs:\n%s\nThis 404 can mean the compartment OCID is wrong, the DEFAULT profile lacks permission in that compartment, the availability domain does not belong to the DEFAULT profile region, or one of the requested shapes is not reservable in that compartment/AD.%s Run with --preflight-only to check shapes without creating a reservation",
+		err,
+		describeRequestedConfigsForError(opts.Configs, availabilityDomain),
+		compartmentOCIDHint(opts.CompartmentID),
+	)
+}
+
+func shapePreflightHint(opts options) string {
+	return compartmentOCIDHint(opts.CompartmentID) + " Use a shape from the available list, choose a compartment/AD where the shape appears, or pass --skip-preflight to send the create request anyway."
+}
+
+func compartmentOCIDHint(compartmentID string) string {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(compartmentID)), "ocid1.tenancy.") {
+		return " You passed a tenancy OCID, which targets the root compartment; if you intended a child compartment, use its ocid1.compartment... OCID."
+	}
+	return ""
+}
+
+func describeRequestedConfigsForError(configs []core.InstanceReservationConfigDetails, availabilityDomain string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "  availabilityDomain=%s\n", availabilityDomain)
+	for i, config := range configs {
+		fmt.Fprintf(&b, "  [%d] %s reservedCount=%d\n", i, describeRequestedConfig(config), int64Value(config.ReservedCount))
+	}
+	return b.String()
+}
+
+func listAvailableReservationShapes(ctx context.Context, client core.ComputeClient, compartmentID string, availabilityDomain string) (map[string]bool, error) {
+	available := make(map[string]bool)
+	var page *string
+
+	for {
+		resp, err := client.ListComputeCapacityReservationInstanceShapes(ctx, core.ListComputeCapacityReservationInstanceShapesRequest{
+			AvailabilityDomain: common.String(availabilityDomain),
+			CompartmentId:      common.String(compartmentID),
+			Limit:              common.Int(1000),
+			Page:               page,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		for _, item := range resp.Items {
+			if item.InstanceShape != nil {
+				available[*item.InstanceShape] = true
+			}
+		}
+
+		if resp.OpcNextPage == nil {
+			break
+		}
+		page = resp.OpcNextPage
+	}
+
+	if len(available) == 0 {
+		return nil, errors.New("OCI returned no capacity reservation shapes for this compartment and availability domain")
+	}
+	return available, nil
+}
+
+func requestedShapes(configs []core.InstanceReservationConfigDetails) map[string]bool {
+	shapes := make(map[string]bool)
+	for _, config := range configs {
+		if config.InstanceShape != nil {
+			shapes[*config.InstanceShape] = true
+		}
+	}
+	return shapes
+}
+
+func sortedStringKeys(values map[string]bool) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func loadInstanceReservationConfigs(path string) ([]core.InstanceReservationConfigDetails, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read --config-file %s: %w", path, err)
+	}
+
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return nil, fmt.Errorf("--config-file %s is empty", path)
+	}
+
+	var configs []core.InstanceReservationConfigDetails
+	if strings.HasPrefix(trimmed, "[") {
+		if err := json.Unmarshal(data, &configs); err != nil {
+			return nil, fmt.Errorf("parse --config-file %s as instanceReservationConfigs array: %w", path, err)
+		}
+		return configs, nil
+	}
+
+	var envelope struct {
+		InstanceReservationConfigs []core.InstanceReservationConfigDetails `json:"instanceReservationConfigs"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return nil, fmt.Errorf("parse --config-file %s: %w", path, err)
+	}
+	return envelope.InstanceReservationConfigs, nil
+}
+
+func buildCreateDetails(opts options, availabilityDomain string) core.CreateComputeCapacityReservationDetails {
 	return core.CreateComputeCapacityReservationDetails{
 		AvailabilityDomain: common.String(availabilityDomain),
 		CompartmentId:      common.String(opts.CompartmentID),
@@ -216,12 +419,25 @@ func buildCreateDetails(opts options, availabilityDomain string) core.CreateComp
 		FreeformTags: map[string]string{
 			"created-by": createdByTag,
 		},
-		InstanceReservationConfigs: []core.InstanceReservationConfigDetails{config},
+		InstanceReservationConfigs: opts.Configs,
 		IsDefaultReservation:       common.Bool(false),
 	}
 }
 
-func buildInstanceReservationConfig(opts options) core.InstanceReservationConfigDetails {
+func buildSingleInstanceReservationConfig(opts options) (core.InstanceReservationConfigDetails, error) {
+	if strings.TrimSpace(opts.Shape) == "" {
+		return core.InstanceReservationConfigDetails{}, errors.New("--instance-type is required when --config-file is not provided")
+	}
+	if opts.OCPUs <= 0 {
+		return core.InstanceReservationConfigDetails{}, errors.New("--ocpus must be greater than 0 when --config-file is not provided")
+	}
+	if opts.MemoryGBs <= 0 {
+		return core.InstanceReservationConfigDetails{}, errors.New("--memory-gbs must be greater than 0 when --config-file is not provided")
+	}
+	if opts.Quantity <= 0 {
+		return core.InstanceReservationConfigDetails{}, errors.New("--quantity must be greater than 0 when --config-file is not provided")
+	}
+
 	config := core.InstanceReservationConfigDetails{
 		InstanceShape: common.String(opts.Shape),
 		InstanceShapeConfig: &core.InstanceReservationShapeConfigDetails{
@@ -237,10 +453,46 @@ func buildInstanceReservationConfig(opts options) core.InstanceReservationConfig
 		config.FaultDomain = common.String(opts.FaultDomain)
 	}
 
-	return config
+	return config, nil
+}
+
+func validateInstanceReservationConfigs(configs []core.InstanceReservationConfigDetails) error {
+	if len(configs) == 0 {
+		return errors.New("at least one instance reservation config is required")
+	}
+
+	for i, config := range configs {
+		prefix := fmt.Sprintf("instanceReservationConfigs[%d]", i)
+		if strings.TrimSpace(value(config.InstanceShape)) == "" {
+			return fmt.Errorf("%s.instanceShape is required", prefix)
+		}
+		if config.ReservedCount == nil || *config.ReservedCount <= 0 {
+			return fmt.Errorf("%s.reservedCount must be greater than 0", prefix)
+		}
+		if config.InstanceShapeConfig != nil {
+			if config.InstanceShapeConfig.Ocpus != nil && *config.InstanceShapeConfig.Ocpus <= 0 {
+				return fmt.Errorf("%s.instanceShapeConfig.ocpus must be greater than 0 when provided", prefix)
+			}
+			if config.InstanceShapeConfig.MemoryInGBs != nil && *config.InstanceShapeConfig.MemoryInGBs <= 0 {
+				return fmt.Errorf("%s.instanceShapeConfig.memoryInGBs must be greater than 0 when provided", prefix)
+			}
+			switch config.InstanceShapeConfig.ResourceManagement {
+			case "", core.InstanceReservationShapeConfigDetailsResourceManagementStatic, core.InstanceReservationShapeConfigDetailsResourceManagementDynamic:
+			default:
+				return fmt.Errorf("%s.instanceShapeConfig.resourceManagement must be STATIC or DYNAMIC when provided", prefix)
+			}
+		}
+	}
+
+	return nil
 }
 
 func printDryRunPayload(opts options, availabilityDomain string) error {
+	fmt.Println("Dry run enabled; OCI create call was not sent.")
+	return printCreatePayload(opts, availabilityDomain)
+}
+
+func printCreatePayload(opts options, availabilityDomain string) error {
 	req := core.CreateComputeCapacityReservationRequest{
 		CreateComputeCapacityReservationDetails: buildCreateDetails(opts, availabilityDomain),
 	}
@@ -252,7 +504,6 @@ func printDryRunPayload(opts options, availabilityDomain string) error {
 	if err != nil {
 		return fmt.Errorf("read dry-run request body: %w", err)
 	}
-	fmt.Println("Dry run enabled; OCI create call was not sent.")
 	fmt.Println(string(body))
 	return nil
 }
@@ -285,6 +536,24 @@ func resolveAvailabilityDomain(ctx context.Context, provider common.Configuratio
 	ad := *resp.Items[0].Name
 	fmt.Printf("No --availability-domain provided; using first tenancy AD: %s\n", ad)
 	return ad, nil
+}
+
+func validateAvailabilityDomainRegion(region string, availabilityDomain string) error {
+	regionMarker := strings.ToUpper(region)
+	if lastDash := strings.LastIndex(regionMarker, "-"); lastDash > 0 {
+		regionMarker = regionMarker[:lastDash]
+	}
+
+	if regionMarker == "" || availabilityDomain == "" {
+		return nil
+	}
+
+	adMarker := strings.ToUpper(availabilityDomain)
+	if strings.Contains(adMarker, regionMarker+"-AD-") {
+		return nil
+	}
+
+	return fmt.Errorf("availability domain %q does not appear to belong to DEFAULT profile region %q; update ~/.oci/config or pass an AD for %s", availabilityDomain, region, regionMarker)
 }
 
 func waitForWorkRequest(ctx context.Context, client workrequests.WorkRequestClient, workRequestID string, pollInterval time.Duration) (workrequests.WorkRequest, error) {
@@ -355,12 +624,13 @@ func ensureReservedQuantity(ctx context.Context, computeClient core.ComputeClien
 		}
 
 		reservation := resp.ComputeCapacityReservation
-		reserved := reservedConfigCount(reservation)
-		fmt.Printf("Reservation check: lifecycle=%s requested=%d reservedCount=%d\n", reservation.LifecycleState, opts.Quantity, reserved)
+		comparison := compareReservationConfigs(opts.Configs, reservation.InstanceReservationConfigs)
+		fmt.Printf("Reservation check: lifecycle=%s requested=%d reservedCount=%d\n", reservation.LifecycleState, comparison.RequestedTotal, comparison.ActualTotal)
 
-		if reserved == opts.Quantity {
+		if comparison.matches() {
 			return validateReservedQuantity(opts, reservation)
 		}
+		printConfigMismatches(comparison)
 
 		switch reservation.LifecycleState {
 		case core.ComputeCapacityReservationLifecycleStateDeleted, core.ComputeCapacityReservationLifecycleStateDeleting:
@@ -373,7 +643,7 @@ func ensureReservedQuantity(ctx context.Context, computeClient core.ComputeClien
 			continue
 		}
 
-		fmt.Printf("Reserved quantity is %d, updating reservation to requested quantity %d\n", reserved, opts.Quantity)
+		fmt.Printf("Reserved configuration does not match request; updating reservation to requested configs\n")
 		updateResp, err := updateCapacityReservation(ctx, computeClient, opts, reservationID, resp.Etag)
 		if err != nil {
 			if reason, retry := retryableReservationUpdateError(err); retry {
@@ -383,7 +653,7 @@ func ensureReservedQuantity(ctx context.Context, computeClient core.ComputeClien
 				}
 				continue
 			}
-			return fmt.Errorf("update capacity reservation %s to reserved quantity %d: %w", reservationID, opts.Quantity, err)
+			return fmt.Errorf("update capacity reservation %s to requested configs: %w", reservationID, err)
 		}
 
 		updateWorkRequestID := value(updateResp.OpcWorkRequestId)
@@ -408,6 +678,16 @@ func ensureReservedQuantity(ctx context.Context, computeClient core.ComputeClien
 		if err := waitForNextReservationCheck(ctx, opts.ReservationCheck); err != nil {
 			return err
 		}
+	}
+}
+
+func (comparison configComparison) matches() bool {
+	return len(comparison.Mismatches) == 0
+}
+
+func printConfigMismatches(comparison configComparison) {
+	for _, mismatch := range comparison.Mismatches {
+		fmt.Printf("Config mismatch: %s\n", mismatch)
 	}
 }
 
@@ -439,13 +719,13 @@ func waitForNextReservationCheck(ctx context.Context, interval time.Duration) er
 }
 
 func validateReservedQuantity(opts options, reservation core.ComputeCapacityReservation) error {
-	reserved := reservedConfigCount(reservation)
+	comparison := compareReservationConfigs(opts.Configs, reservation.InstanceReservationConfigs)
 	reservationID := value(reservation.Id)
 
 	fmt.Printf("Reservation completed: %s\n", reservationID)
 	fmt.Printf("Lifecycle state: %s\n", reservation.LifecycleState)
-	fmt.Printf("Requested quantity: %d\n", opts.Quantity)
-	fmt.Printf("Reserved count total: %d\n", reserved)
+	fmt.Printf("Requested quantity total: %d\n", comparison.RequestedTotal)
+	fmt.Printf("Reserved count total: %d\n", comparison.ActualTotal)
 
 	for i, config := range reservation.InstanceReservationConfigs {
 		fmt.Printf("Config %d: shape=%s reservedCount=%d", i+1, value(config.InstanceShape), int64Value(config.ReservedCount))
@@ -458,17 +738,18 @@ func validateReservedQuantity(opts options, reservation core.ComputeCapacityRese
 		fmt.Println()
 	}
 
-	if reserved != opts.Quantity {
-		return fmt.Errorf("reservation quantity mismatch for %s: requested %d, OCI reserved %d; the reservation remains in OCI, so review or delete it if this partial reservation is not desired", reservationID, opts.Quantity, reserved)
+	if !comparison.matches() {
+		printConfigMismatches(comparison)
+		return fmt.Errorf("reservation quantity mismatch for %s: requested %d, OCI reserved %d; the reservation remains in OCI, so review or delete it if this partial reservation is not desired", reservationID, comparison.RequestedTotal, comparison.ActualTotal)
 	}
 
-	fmt.Println("Validation passed: reserved quantity matches requested quantity")
+	fmt.Println("Validation passed: reservedCount values match requested configs")
 	return nil
 }
 
-func reservedConfigCount(reservation core.ComputeCapacityReservation) int64 {
+func requestedConfigTotal(configs []core.InstanceReservationConfigDetails) int64 {
 	var total int64
-	for _, config := range reservation.InstanceReservationConfigs {
+	for _, config := range configs {
 		if config.ReservedCount != nil {
 			total += *config.ReservedCount
 		}
@@ -476,8 +757,152 @@ func reservedConfigCount(reservation core.ComputeCapacityReservation) int64 {
 	return total
 }
 
-func defaultDisplayName(shape string) string {
-	clean := strings.NewReplacer(".", "-", "_", "-").Replace(shape)
+func actualConfigTotal(configs []core.InstanceReservationConfig) int64 {
+	var total int64
+	for _, config := range configs {
+		if config.ReservedCount != nil {
+			total += *config.ReservedCount
+		}
+	}
+	return total
+}
+
+func compareReservationConfigs(requested []core.InstanceReservationConfigDetails, actual []core.InstanceReservationConfig) configComparison {
+	requestedCounts, requestedLabels := requestedConfigCounts(requested)
+	actualCounts, actualLabels := actualConfigCounts(actual)
+
+	comparison := configComparison{
+		RequestedTotal: requestedConfigTotal(requested),
+		ActualTotal:    actualConfigTotal(actual),
+	}
+
+	for key, requestedCount := range requestedCounts {
+		actualCount := actualCounts[key]
+		if actualCount != requestedCount {
+			comparison.Mismatches = append(comparison.Mismatches, fmt.Sprintf("%s requested reservedCount=%d actual reservedCount=%d", requestedLabels[key], requestedCount, actualCount))
+		}
+	}
+
+	for key, actualCount := range actualCounts {
+		if _, ok := requestedCounts[key]; !ok && actualCount != 0 {
+			comparison.Mismatches = append(comparison.Mismatches, fmt.Sprintf("unexpected %s actual reservedCount=%d", actualLabels[key], actualCount))
+		}
+	}
+
+	return comparison
+}
+
+func requestedConfigCounts(configs []core.InstanceReservationConfigDetails) (map[string]int64, map[string]string) {
+	counts := make(map[string]int64, len(configs))
+	labels := make(map[string]string, len(configs))
+	for _, config := range configs {
+		key := requestedConfigKey(config)
+		counts[key] += int64Value(config.ReservedCount)
+		labels[key] = describeRequestedConfig(config)
+	}
+	return counts, labels
+}
+
+func actualConfigCounts(configs []core.InstanceReservationConfig) (map[string]int64, map[string]string) {
+	counts := make(map[string]int64, len(configs))
+	labels := make(map[string]string, len(configs))
+	for _, config := range configs {
+		key := actualConfigKey(config)
+		counts[key] += int64Value(config.ReservedCount)
+		labels[key] = describeActualConfig(config)
+	}
+	return counts, labels
+}
+
+func requestedConfigKey(config core.InstanceReservationConfigDetails) string {
+	shapeConfig := config.InstanceShapeConfig
+	return strings.Join([]string{
+		value(config.InstanceShape),
+		float32PointerKey(shapeConfigOCPUs(shapeConfig)),
+		float32PointerKey(shapeConfigMemory(shapeConfig)),
+		value(config.FaultDomain),
+		value(config.ClusterPlacementGroupId),
+		clusterConfigKey(config.ClusterConfig),
+	}, "|")
+}
+
+func actualConfigKey(config core.InstanceReservationConfig) string {
+	shapeConfig := config.InstanceShapeConfig
+	return strings.Join([]string{
+		value(config.InstanceShape),
+		float32PointerKey(shapeConfigOCPUs(shapeConfig)),
+		float32PointerKey(shapeConfigMemory(shapeConfig)),
+		value(config.FaultDomain),
+		value(config.ClusterPlacementGroupId),
+		clusterConfigKey(config.ClusterConfig),
+	}, "|")
+}
+
+func describeRequestedConfig(config core.InstanceReservationConfigDetails) string {
+	return describeConfig(value(config.InstanceShape), config.InstanceShapeConfig, value(config.FaultDomain), value(config.ClusterPlacementGroupId))
+}
+
+func describeActualConfig(config core.InstanceReservationConfig) string {
+	return describeConfig(value(config.InstanceShape), config.InstanceShapeConfig, value(config.FaultDomain), value(config.ClusterPlacementGroupId))
+}
+
+func describeConfig(shape string, shapeConfig *core.InstanceReservationShapeConfigDetails, faultDomain string, clusterPlacementGroupID string) string {
+	parts := []string{fmt.Sprintf("shape=%s", shape)}
+	if shapeConfig != nil {
+		if shapeConfig.Ocpus != nil {
+			parts = append(parts, fmt.Sprintf("ocpus=%s", float32PointerKey(shapeConfig.Ocpus)))
+		}
+		if shapeConfig.MemoryInGBs != nil {
+			parts = append(parts, fmt.Sprintf("memoryInGBs=%s", float32PointerKey(shapeConfig.MemoryInGBs)))
+		}
+	}
+	if faultDomain != "" {
+		parts = append(parts, fmt.Sprintf("faultDomain=%s", faultDomain))
+	}
+	if clusterPlacementGroupID != "" {
+		parts = append(parts, fmt.Sprintf("clusterPlacementGroupId=%s", clusterPlacementGroupID))
+	}
+	return strings.Join(parts, " ")
+}
+
+func shapeConfigOCPUs(config *core.InstanceReservationShapeConfigDetails) *float32 {
+	if config == nil {
+		return nil
+	}
+	return config.Ocpus
+}
+
+func shapeConfigMemory(config *core.InstanceReservationShapeConfigDetails) *float32 {
+	if config == nil {
+		return nil
+	}
+	return config.MemoryInGBs
+}
+
+func float32PointerKey(ptr *float32) string {
+	if ptr == nil {
+		return ""
+	}
+	return fmt.Sprintf("%g", *ptr)
+}
+
+func clusterConfigKey(config *core.ClusterConfigDetails) string {
+	if config == nil {
+		return ""
+	}
+	body, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Sprintf("%v", config)
+	}
+	return string(body)
+}
+
+func defaultDisplayName(configs []core.InstanceReservationConfigDetails) string {
+	name := "multi"
+	if len(configs) == 1 {
+		name = value(configs[0].InstanceShape)
+	}
+	clean := strings.NewReplacer(".", "-", "_", "-").Replace(name)
 	return fmt.Sprintf("cap-res-%s-%s", clean, time.Now().UTC().Format("20060102-150405"))
 }
 

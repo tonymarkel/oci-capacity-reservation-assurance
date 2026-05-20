@@ -1,0 +1,20 @@
+{
+  "instanceReservationConfigs": [
+    {
+      "instanceShape": "VM.Standard.E6.Flex",
+      "instanceShapeConfig": {
+        "ocpus": 3,
+        "memoryInGBs": 12
+      },
+      "reservedCount": 3
+    },
+    {
+      "instanceShape": "VM.Standard.E5.Flex",
+      "instanceShapeConfig": {
+        "ocpus": 1,
+        "memoryInGBs": 4
+      },
+      "reservedCount": 2
+    }
+  ]
+}
