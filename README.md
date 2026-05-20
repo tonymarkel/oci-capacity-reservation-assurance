@@ -6,8 +6,8 @@ Runs a script locally to ensure that a capacity reservation exists in the specif
 This Go script:
 
 1. Uses the `DEFAULT` profile in `~/.oci/config`.
-2. Uses your tenancy-specific availability domain name, such as `Dfpy:US-PHOENIX-AD-2`.
-3. Creates an OCI compute capacity reservation for either one CLI-specified config or many configs from a JSON file.
+2. Uses your tenancy-specific availability domain name, such as `Dfpy:US-PHOENIX-AD-2`, or `ALL` to spread the request across every AD in the current region.
+3. Creates an OCI compute capacity reservation for either one CLI-specified config or many configs from a JSON file. With `--availability-domain ALL`, it creates one reservation per AD that receives non-zero capacity. If the JSON configs include `availabilityDomain`, the script uses that custom distribution instead.
 4. Waits for the returned work request to reach a terminal state.
 5. Checks the reservation every 30 seconds until each requested `instanceReservationConfigs[].reservedCount` matches OCI's returned config.
 6. If the reservation is active but any capacity configuration is still short, updates the capacity configs back to the requested values and repeats the check/update cycle until they match or `--timeout` expires.
@@ -40,6 +40,15 @@ go run . \
   --availability-domain Uocm:US-ASHBURN-AD-1
 ```
 
+Spread across all availability domains in the `DEFAULT` profile region:
+
+```bash
+go run . \
+  --config-file example.json \
+  --compartment-id ocid1.compartment.oc1..example \
+  --availability-domain ALL
+```
+
 The config file can be either a raw JSON array or an object with `instanceReservationConfigs`:
 
 ```json
@@ -65,7 +74,45 @@ The config file can be either a raw JSON array or an object with `instanceReserv
 }
 ```
 
-`--availability-domain` is recommended because capacity reservations are AD-specific. If you omit it, the script lists availability domains in the tenancy from the `DEFAULT` profile and uses the first one returned.
+To make your own distribution, add `availabilityDomain` to every config in the JSON file. The script groups configs by that value and creates one reservation per AD:
+
+```json
+{
+  "instanceReservationConfigs": [
+    {
+      "instanceShape": "VM.Standard.E6.Flex",
+      "availabilityDomain": "Uocm:PHX-AD-1",
+      "instanceShapeConfig": {
+        "ocpus": 3,
+        "memoryInGBs": 12
+      },
+      "reservedCount": 3
+    },
+    {
+      "instanceShape": "VM.Standard.E6.Flex",
+      "availabilityDomain": "Uocm:PHX-AD-2",
+      "instanceShapeConfig": {
+        "ocpus": 3,
+        "memoryInGBs": 12
+      },
+      "reservedCount": 2
+    },
+    {
+      "instanceShape": "VM.Standard.E6.Flex",
+      "availabilityDomain": "Uocm:PHX-AD-3",
+      "instanceShapeConfig": {
+        "ocpus": 3,
+        "memoryInGBs": 12
+      },
+      "reservedCount": 1
+    }
+  ]
+}
+```
+
+`--availability-domain` is recommended because capacity reservations are AD-specific. If you omit it, the script lists availability domains in the tenancy from the `DEFAULT` profile and uses the first one returned. If you set `--availability-domain ALL`, the script lists all ADs in the current region and splits each requested `reservedCount` as evenly as possible across them. For example, a quantity of 5 across 3 ADs becomes 2, 2, and 1; a quantity of 2 across 3 ADs creates reservations in two ADs and skips the zero-count AD.
+
+If the JSON file includes `availabilityDomain`, those values take precedence over the `--availability-domain` flag. Include `availabilityDomain` on every config entry when using custom distribution.
 
 Optional flags:
 

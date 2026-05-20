@@ -2,6 +2,7 @@
   "instanceReservationConfigs": [
     {
       "instanceShape": "VM.Standard.E6.Flex",
+      "availabilityDomain": "DfpY:US-ASHBURN-AD-1",
       "instanceShapeConfig": {
         "ocpus": 3,
         "memoryInGBs": 12
@@ -9,12 +10,31 @@
       "reservedCount": 3
     },
     {
+      "instanceShape": "VM.Standard.E6.Flex",
+      "availabilityDomain": "DfpY:US-ASHBURN-AD-2",
+      "instanceShapeConfig": {
+        "ocpus": 3,
+        "memoryInGBs": 12
+      },
+      "reservedCount": 2
+    },
+    {
+      "instanceShape": "VM.Standard.E6.Flex",
+      "availabilityDomain": "DfpY:US-ASHBURN-AD-3",
+      "instanceShapeConfig": {
+        "ocpus": 3,
+        "memoryInGBs": 12
+      },
+      "reservedCount": 2
+    },
+    {
       "instanceShape": "VM.Standard.E5.Flex",
+      "availabilityDomain": "DfpY:US-ASHBURN-AD-1",
       "instanceShapeConfig": {
         "ocpus": 1,
         "memoryInGBs": 4
       },
-      "reservedCount": 2
+      "reservedCount": 5
     }
   ]
 }

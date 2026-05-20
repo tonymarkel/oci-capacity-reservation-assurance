@@ -38,12 +38,18 @@ type options struct {
 	SkipPreflight      bool
 	ResourceManagement string
 	Configs            []core.InstanceReservationConfigDetails
+	ConfigADs          []string
 }
 
 type configComparison struct {
 	RequestedTotal int64
 	ActualTotal    int64
 	Mismatches     []string
+}
+
+type availabilityDomainPlan struct {
+	AvailabilityDomain string
+	Options            options
 }
 
 func main() {
@@ -77,7 +83,7 @@ func parseFlags(args []string) (options, error) {
 	fs.StringVar(&opts.CompartmentID, "compartment", "", "alias for --compartment-id")
 	fs.Int64Var(&opts.Quantity, "quantity", 0, "number of instances to reserve")
 	fs.StringVar(&opts.ConfigFile, "config-file", "", "JSON file containing one or more instanceReservationConfigs")
-	fs.StringVar(&opts.AvailabilityDomain, "availability-domain", "", "availability domain name, for example Uocm:US-ASHBURN-AD-1; defaults to the first AD in the tenancy")
+	fs.StringVar(&opts.AvailabilityDomain, "availability-domain", "", "availability domain name, for example Uocm:US-ASHBURN-AD-1; use ALL to spread counts across all ADs in the DEFAULT profile region; defaults to the first AD in the tenancy")
 	fs.StringVar(&opts.FaultDomain, "fault-domain", "", "optional fault domain, for example FAULT-DOMAIN-1")
 	fs.StringVar(&opts.DisplayName, "display-name", "", "optional display name for the capacity reservation")
 	fs.DurationVar(&opts.PollInterval, "poll-interval", 15*time.Second, "work request polling interval")
@@ -122,7 +128,7 @@ func parseFlags(args []string) (options, error) {
 	}
 
 	if strings.TrimSpace(opts.ConfigFile) != "" {
-		configs, err := loadInstanceReservationConfigs(opts.ConfigFile)
+		configs, configADs, err := loadInstanceReservationConfigs(opts.ConfigFile)
 		if err != nil {
 			return opts, err
 		}
@@ -130,6 +136,7 @@ func parseFlags(args []string) (options, error) {
 			return opts, errors.New("--config-file cannot be combined with --instance-type, --ocpus, --memory-gbs, --quantity, --fault-domain, or --resource-management")
 		}
 		opts.Configs = configs
+		opts.ConfigADs = configADs
 	} else {
 		config, err := buildSingleInstanceReservationConfig(opts)
 		if err != nil {
@@ -139,6 +146,9 @@ func parseFlags(args []string) (options, error) {
 	}
 
 	if err := validateInstanceReservationConfigs(opts.Configs); err != nil {
+		return opts, err
+	}
+	if err := validateConfigAvailabilityDomains(opts.Configs, opts.ConfigADs); err != nil {
 		return opts, err
 	}
 	opts.Quantity = requestedConfigTotal(opts.Configs)
@@ -170,16 +180,32 @@ func run(parent context.Context, opts options) error {
 		return fmt.Errorf("read region from DEFAULT OCI profile: %w", err)
 	}
 
-	availabilityDomain, err := resolveAvailabilityDomain(ctx, provider, opts.AvailabilityDomain)
-	if err != nil {
-		return err
+	var availabilityDomains []string
+	if usesConfigAvailabilityDomains(opts) {
+		if strings.TrimSpace(opts.AvailabilityDomain) != "" {
+			fmt.Println("Config file availabilityDomain values found; using them instead of --availability-domain")
+		}
+		availabilityDomains = availabilityDomainsFromConfigDistribution(opts.ConfigADs)
+	} else {
+		var err error
+		availabilityDomains, err = resolveAvailabilityDomains(ctx, provider, opts.AvailabilityDomain)
+		if err != nil {
+			return err
+		}
 	}
-	if err := validateAvailabilityDomainRegion(region, availabilityDomain); err != nil {
+	for _, availabilityDomain := range availabilityDomains {
+		if err := validateAvailabilityDomainRegion(region, availabilityDomain); err != nil {
+			return err
+		}
+	}
+
+	plans, err := buildAvailabilityDomainPlans(opts, availabilityDomains)
+	if err != nil {
 		return err
 	}
 
 	if opts.DryRun {
-		return printDryRunPayload(opts, availabilityDomain)
+		return printDryRunPayloads(plans)
 	}
 
 	computeClient, err := core.NewComputeClientWithConfigurationProvider(provider)
@@ -189,10 +215,12 @@ func run(parent context.Context, opts options) error {
 
 	preflightRan := false
 	if !opts.SkipPreflight {
-		var err error
-		preflightRan, err = preflightRequestedShapes(ctx, computeClient, opts, availabilityDomain)
-		if err != nil {
-			return err
+		for _, plan := range plans {
+			ran, err := preflightRequestedShapes(ctx, computeClient, plan.Options, plan.AvailabilityDomain)
+			preflightRan = preflightRan || ran
+			if err != nil {
+				return err
+			}
 		}
 	} else {
 		fmt.Println("Shape preflight skipped")
@@ -205,7 +233,7 @@ func run(parent context.Context, opts options) error {
 		} else {
 			fmt.Println("Preflight could not be completed; OCI create call was not sent.")
 		}
-		return printCreatePayload(opts, availabilityDomain)
+		return printCreatePayloads(plans)
 	}
 
 	workRequestClient, err := workrequests.NewWorkRequestClientWithConfigurationProvider(provider)
@@ -213,40 +241,49 @@ func run(parent context.Context, opts options) error {
 		return fmt.Errorf("create work request client: %w", err)
 	}
 
-	fmt.Printf("Creating capacity reservation %q in region %s, availability domain %s\n", opts.DisplayName, region, availabilityDomain)
-	createResp, err := createCapacityReservation(ctx, computeClient, opts, availabilityDomain)
-	if err != nil {
-		return createCapacityReservationError(err, opts, availabilityDomain)
+	for _, plan := range plans {
+		availabilityDomain := plan.AvailabilityDomain
+		planOpts := plan.Options
+
+		fmt.Printf("Creating capacity reservation %q in region %s, availability domain %s\n", planOpts.DisplayName, region, availabilityDomain)
+		createResp, err := createCapacityReservation(ctx, computeClient, planOpts, availabilityDomain)
+		if err != nil {
+			return createCapacityReservationError(err, planOpts, availabilityDomain)
+		}
+
+		reservationID := value(createResp.ComputeCapacityReservation.Id)
+		workRequestID := value(createResp.OpcWorkRequestId)
+		fmt.Printf("Create request accepted\n")
+		if reservationID != "" {
+			fmt.Printf("Reservation ID: %s\n", reservationID)
+		}
+		if workRequestID == "" {
+			return errors.New("create response did not include an opc-work-request-id")
+		}
+		fmt.Printf("Work request ID: %s\n", workRequestID)
+
+		workRequest, err := waitForWorkRequest(ctx, workRequestClient, workRequestID, planOpts.PollInterval)
+		if err != nil {
+			return err
+		}
+
+		if workRequest.Status != workrequests.WorkRequestStatusSucceeded {
+			return workRequestFailure(ctx, workRequestClient, workRequestID, workRequest.Status)
+		}
+
+		if reservationID == "" {
+			reservationID = reservationIDFromWorkRequest(workRequest)
+		}
+		if reservationID == "" {
+			return errors.New("work request succeeded, but no compute capacity reservation OCID was found")
+		}
+
+		if err := ensureReservedQuantity(ctx, computeClient, workRequestClient, planOpts, reservationID); err != nil {
+			return err
+		}
 	}
 
-	reservationID := value(createResp.ComputeCapacityReservation.Id)
-	workRequestID := value(createResp.OpcWorkRequestId)
-	fmt.Printf("Create request accepted\n")
-	if reservationID != "" {
-		fmt.Printf("Reservation ID: %s\n", reservationID)
-	}
-	if workRequestID == "" {
-		return errors.New("create response did not include an opc-work-request-id")
-	}
-	fmt.Printf("Work request ID: %s\n", workRequestID)
-
-	workRequest, err := waitForWorkRequest(ctx, workRequestClient, workRequestID, opts.PollInterval)
-	if err != nil {
-		return err
-	}
-
-	if workRequest.Status != workrequests.WorkRequestStatusSucceeded {
-		return workRequestFailure(ctx, workRequestClient, workRequestID, workRequest.Status)
-	}
-
-	if reservationID == "" {
-		reservationID = reservationIDFromWorkRequest(workRequest)
-	}
-	if reservationID == "" {
-		return errors.New("work request succeeded, but no compute capacity reservation OCID was found")
-	}
-
-	return ensureReservedQuantity(ctx, computeClient, workRequestClient, opts, reservationID)
+	return nil
 }
 
 func createCapacityReservation(ctx context.Context, client core.ComputeClient, opts options, availabilityDomain string) (core.CreateComputeCapacityReservationResponse, error) {
@@ -264,6 +301,116 @@ func updateCapacityReservation(ctx context.Context, client core.ComputeClient, o
 			InstanceReservationConfigs: opts.Configs,
 		},
 	})
+}
+
+func buildAvailabilityDomainPlans(opts options, availabilityDomains []string) ([]availabilityDomainPlan, error) {
+	if len(availabilityDomains) == 0 {
+		return nil, errors.New("no availability domains were resolved")
+	}
+
+	if usesConfigAvailabilityDomains(opts) {
+		return buildAvailabilityDomainPlansFromConfigDistribution(opts, availabilityDomains)
+	}
+
+	if len(availabilityDomains) == 1 {
+		return []availabilityDomainPlan{{
+			AvailabilityDomain: availabilityDomains[0],
+			Options:            opts,
+		}}, nil
+	}
+
+	splitConfigs := splitConfigsAcrossAvailabilityDomains(opts.Configs, len(availabilityDomains))
+	plans := make([]availabilityDomainPlan, 0, len(availabilityDomains))
+	fmt.Printf("Spreading requested capacity across %d availability domains\n", len(availabilityDomains))
+	for i, availabilityDomain := range availabilityDomains {
+		if len(splitConfigs[i]) == 0 {
+			fmt.Printf("Availability domain %s receives no reserved capacity; skipping create\n", availabilityDomain)
+			continue
+		}
+
+		planOpts := opts
+		planOpts.Configs = splitConfigs[i]
+		planOpts.Quantity = requestedConfigTotal(splitConfigs[i])
+		planOpts.DisplayName = displayNameForAvailabilityDomain(opts.DisplayName, availabilityDomain)
+		fmt.Printf("Availability domain %s requested reservedCount total: %d\n", availabilityDomain, planOpts.Quantity)
+		plans = append(plans, availabilityDomainPlan{
+			AvailabilityDomain: availabilityDomain,
+			Options:            planOpts,
+		})
+	}
+	if len(plans) == 0 {
+		return nil, errors.New("split produced no capacity reservation configs")
+	}
+
+	return plans, nil
+}
+
+func buildAvailabilityDomainPlansFromConfigDistribution(opts options, availabilityDomains []string) ([]availabilityDomainPlan, error) {
+	configsByAD := make(map[string][]core.InstanceReservationConfigDetails, len(availabilityDomains))
+	for i, config := range opts.Configs {
+		availabilityDomain := opts.ConfigADs[i]
+		configsByAD[availabilityDomain] = append(configsByAD[availabilityDomain], config)
+	}
+
+	plans := make([]availabilityDomainPlan, 0, len(availabilityDomains))
+	fmt.Printf("Using availabilityDomain values from config file across %d availability domains\n", len(availabilityDomains))
+	for _, availabilityDomain := range availabilityDomains {
+		configs := configsByAD[availabilityDomain]
+		if len(configs) == 0 {
+			continue
+		}
+
+		planOpts := opts
+		planOpts.Configs = configs
+		planOpts.ConfigADs = nil
+		planOpts.Quantity = requestedConfigTotal(configs)
+		if len(availabilityDomains) > 1 {
+			planOpts.DisplayName = displayNameForAvailabilityDomain(opts.DisplayName, availabilityDomain)
+		}
+		fmt.Printf("Availability domain %s requested reservedCount total: %d\n", availabilityDomain, planOpts.Quantity)
+		plans = append(plans, availabilityDomainPlan{
+			AvailabilityDomain: availabilityDomain,
+			Options:            planOpts,
+		})
+	}
+	if len(plans) == 0 {
+		return nil, errors.New("config file availabilityDomain distribution produced no capacity reservation configs")
+	}
+
+	return plans, nil
+}
+
+func splitConfigsAcrossAvailabilityDomains(configs []core.InstanceReservationConfigDetails, availabilityDomainCount int) [][]core.InstanceReservationConfigDetails {
+	splitConfigs := make([][]core.InstanceReservationConfigDetails, availabilityDomainCount)
+	for _, config := range configs {
+		total := int64Value(config.ReservedCount)
+		base := total / int64(availabilityDomainCount)
+		remainder := total % int64(availabilityDomainCount)
+
+		for i := 0; i < availabilityDomainCount; i++ {
+			count := base
+			if int64(i) < remainder {
+				count++
+			}
+			if count == 0 {
+				continue
+			}
+
+			configCopy := config
+			configCopy.ReservedCount = common.Int64(count)
+			splitConfigs[i] = append(splitConfigs[i], configCopy)
+		}
+	}
+	return splitConfigs
+}
+
+func displayNameForAvailabilityDomain(baseDisplayName string, availabilityDomain string) string {
+	cleanAD := availabilityDomain
+	if idx := strings.LastIndex(cleanAD, ":"); idx >= 0 && idx+1 < len(cleanAD) {
+		cleanAD = cleanAD[idx+1:]
+	}
+	cleanAD = strings.NewReplacer(":", "-", ".", "-", "_", "-").Replace(cleanAD)
+	return fmt.Sprintf("%s-%s", baseDisplayName, cleanAD)
 }
 
 func preflightRequestedShapes(ctx context.Context, client core.ComputeClient, opts options, availabilityDomain string) (bool, error) {
@@ -383,32 +530,77 @@ func sortedStringKeys(values map[string]bool) []string {
 	return keys
 }
 
-func loadInstanceReservationConfigs(path string) ([]core.InstanceReservationConfigDetails, error) {
+func usesConfigAvailabilityDomains(opts options) bool {
+	if len(opts.ConfigADs) == 0 {
+		return false
+	}
+	for _, availabilityDomain := range opts.ConfigADs {
+		if strings.TrimSpace(availabilityDomain) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func availabilityDomainsFromConfigDistribution(configADs []string) []string {
+	seen := make(map[string]bool, len(configADs))
+	availabilityDomains := make([]string, 0, len(configADs))
+	for _, availabilityDomain := range configADs {
+		if seen[availabilityDomain] {
+			continue
+		}
+		seen[availabilityDomain] = true
+		availabilityDomains = append(availabilityDomains, availabilityDomain)
+	}
+	return availabilityDomains
+}
+
+func loadInstanceReservationConfigs(path string) ([]core.InstanceReservationConfigDetails, []string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read --config-file %s: %w", path, err)
+		return nil, nil, fmt.Errorf("read --config-file %s: %w", path, err)
 	}
 
 	trimmed := strings.TrimSpace(string(data))
 	if trimmed == "" {
-		return nil, fmt.Errorf("--config-file %s is empty", path)
+		return nil, nil, fmt.Errorf("--config-file %s is empty", path)
 	}
 
-	var configs []core.InstanceReservationConfigDetails
+	var rawConfigs []json.RawMessage
 	if strings.HasPrefix(trimmed, "[") {
-		if err := json.Unmarshal(data, &configs); err != nil {
-			return nil, fmt.Errorf("parse --config-file %s as instanceReservationConfigs array: %w", path, err)
+		if err := json.Unmarshal(data, &rawConfigs); err != nil {
+			return nil, nil, fmt.Errorf("parse --config-file %s as instanceReservationConfigs array: %w", path, err)
 		}
-		return configs, nil
+	} else {
+		var envelope struct {
+			InstanceReservationConfigs []json.RawMessage `json:"instanceReservationConfigs"`
+		}
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			return nil, nil, fmt.Errorf("parse --config-file %s: %w", path, err)
+		}
+		rawConfigs = envelope.InstanceReservationConfigs
 	}
 
-	var envelope struct {
-		InstanceReservationConfigs []core.InstanceReservationConfigDetails `json:"instanceReservationConfigs"`
+	configs := make([]core.InstanceReservationConfigDetails, 0, len(rawConfigs))
+	configADs := make([]string, 0, len(rawConfigs))
+	for i, rawConfig := range rawConfigs {
+		var config core.InstanceReservationConfigDetails
+		if err := json.Unmarshal(rawConfig, &config); err != nil {
+			return nil, nil, fmt.Errorf("parse --config-file %s instanceReservationConfigs[%d]: %w", path, i, err)
+		}
+		var metadata struct {
+			AvailabilityDomainDash  string `json:"availability-domain"`
+			AvailabilityDomainSnake string `json:"availability_domain"`
+			AvailabilityDomainCamel string `json:"availabilityDomain"`
+		}
+		if err := json.Unmarshal(rawConfig, &metadata); err != nil {
+			return nil, nil, fmt.Errorf("parse --config-file %s instanceReservationConfigs[%d] metadata: %w", path, i, err)
+		}
+		configs = append(configs, config)
+		configADs = append(configADs, firstNonEmpty(metadata.AvailabilityDomainCamel, metadata.AvailabilityDomainSnake, metadata.AvailabilityDomainDash))
 	}
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return nil, fmt.Errorf("parse --config-file %s: %w", path, err)
-	}
-	return envelope.InstanceReservationConfigs, nil
+
+	return configs, configADs, nil
 }
 
 func buildCreateDetails(opts options, availabilityDomain string) core.CreateComputeCapacityReservationDetails {
@@ -487,9 +679,49 @@ func validateInstanceReservationConfigs(configs []core.InstanceReservationConfig
 	return nil
 }
 
-func printDryRunPayload(opts options, availabilityDomain string) error {
+func validateConfigAvailabilityDomains(configs []core.InstanceReservationConfigDetails, configADs []string) error {
+	if len(configADs) == 0 {
+		return nil
+	}
+	if len(configADs) != len(configs) {
+		return fmt.Errorf("internal error: config availability domain count %d does not match config count %d", len(configADs), len(configs))
+	}
+
+	anyProvided := false
+	allProvided := true
+	for i, availabilityDomain := range configADs {
+		availabilityDomain = strings.TrimSpace(availabilityDomain)
+		configADs[i] = availabilityDomain
+		if availabilityDomain == "" {
+			allProvided = false
+			continue
+		}
+		anyProvided = true
+		if strings.EqualFold(availabilityDomain, "ALL") {
+			return fmt.Errorf("instanceReservationConfigs[%d].availabilityDomain must be an actual availability domain name, not ALL", i)
+		}
+	}
+	if anyProvided && !allProvided {
+		return errors.New("when any config-file entry includes availabilityDomain, every instanceReservationConfigs entry must include availabilityDomain")
+	}
+	return nil
+}
+
+func printDryRunPayloads(plans []availabilityDomainPlan) error {
 	fmt.Println("Dry run enabled; OCI create call was not sent.")
-	return printCreatePayload(opts, availabilityDomain)
+	return printCreatePayloads(plans)
+}
+
+func printCreatePayloads(plans []availabilityDomainPlan) error {
+	for i, plan := range plans {
+		if len(plans) > 1 {
+			fmt.Printf("Create payload %d/%d for availability domain %s:\n", i+1, len(plans), plan.AvailabilityDomain)
+		}
+		if err := printCreatePayload(plan.Options, plan.AvailabilityDomain); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func printCreatePayload(opts options, availabilityDomain string) error {
@@ -508,52 +740,96 @@ func printCreatePayload(opts options, availabilityDomain string) error {
 	return nil
 }
 
-func resolveAvailabilityDomain(ctx context.Context, provider common.ConfigurationProvider, explicitAD string) (string, error) {
-	if strings.TrimSpace(explicitAD) != "" {
-		return explicitAD, nil
+func resolveAvailabilityDomains(ctx context.Context, provider common.ConfigurationProvider, explicitAD string) ([]string, error) {
+	explicitAD = strings.TrimSpace(explicitAD)
+	switch {
+	case strings.EqualFold(explicitAD, "ALL"):
+		availabilityDomains, err := listAvailabilityDomainNames(ctx, provider)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Printf("--availability-domain ALL requested; using %d availability domains: %s\n", len(availabilityDomains), strings.Join(availabilityDomains, ", "))
+		return availabilityDomains, nil
+	case explicitAD != "":
+		return []string{explicitAD}, nil
 	}
 
+	availabilityDomains, err := listAvailabilityDomainNames(ctx, provider)
+	if err != nil {
+		return nil, err
+	}
+	ad := availabilityDomains[0]
+	fmt.Printf("No --availability-domain provided; using first tenancy AD: %s\n", ad)
+	return []string{ad}, nil
+}
+
+func listAvailabilityDomainNames(ctx context.Context, provider common.ConfigurationProvider) ([]string, error) {
 	tenancyID, err := provider.TenancyOCID()
 	if err != nil {
-		return "", fmt.Errorf("read tenancy OCID from DEFAULT OCI profile while resolving availability domain: %w", err)
+		return nil, fmt.Errorf("read tenancy OCID from DEFAULT OCI profile while resolving availability domain: %w", err)
 	}
 
 	client, err := identity.NewIdentityClientWithConfigurationProvider(provider)
 	if err != nil {
-		return "", fmt.Errorf("create identity client while resolving availability domain: %w", err)
+		return nil, fmt.Errorf("create identity client while resolving availability domain: %w", err)
 	}
 
 	resp, err := client.ListAvailabilityDomains(ctx, identity.ListAvailabilityDomainsRequest{
 		CompartmentId: common.String(tenancyID),
 	})
 	if err != nil {
-		return "", fmt.Errorf("list availability domains for tenancy %s: %w", tenancyID, err)
+		return nil, fmt.Errorf("list availability domains for tenancy %s: %w", tenancyID, err)
 	}
-	if len(resp.Items) == 0 || resp.Items[0].Name == nil {
-		return "", errors.New("no availability domains were returned; provide --availability-domain explicitly")
+	var availabilityDomains []string
+	for _, item := range resp.Items {
+		if item.Name != nil && strings.TrimSpace(*item.Name) != "" {
+			availabilityDomains = append(availabilityDomains, *item.Name)
+		}
 	}
-
-	ad := *resp.Items[0].Name
-	fmt.Printf("No --availability-domain provided; using first tenancy AD: %s\n", ad)
-	return ad, nil
+	if len(availabilityDomains) == 0 {
+		return nil, errors.New("no availability domains were returned; provide --availability-domain explicitly")
+	}
+	return availabilityDomains, nil
 }
 
 func validateAvailabilityDomainRegion(region string, availabilityDomain string) error {
-	regionMarker := strings.ToUpper(region)
-	if lastDash := strings.LastIndex(regionMarker, "-"); lastDash > 0 {
-		regionMarker = regionMarker[:lastDash]
-	}
-
-	if regionMarker == "" || availabilityDomain == "" {
+	regionMarkers := availabilityDomainRegionMarkers(region)
+	if len(regionMarkers) == 0 || availabilityDomain == "" {
 		return nil
 	}
 
 	adMarker := strings.ToUpper(availabilityDomain)
-	if strings.Contains(adMarker, regionMarker+"-AD-") {
+	for _, regionMarker := range regionMarkers {
+		if strings.Contains(adMarker, regionMarker+"-AD-") {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("availability domain %q does not appear to belong to DEFAULT profile region %q; update ~/.oci/config or pass an AD for %s", availabilityDomain, region, strings.Join(regionMarkers, " or "))
+}
+
+func availabilityDomainRegionMarkers(region string) []string {
+	region = strings.ToLower(strings.TrimSpace(region))
+	if region == "" {
 		return nil
 	}
 
-	return fmt.Errorf("availability domain %q does not appear to belong to DEFAULT profile region %q; update ~/.oci/config or pass an AD for %s", availabilityDomain, region, regionMarker)
+	longMarker := strings.ToUpper(region)
+	if lastDash := strings.LastIndex(longMarker, "-"); lastDash > 0 {
+		longMarker = longMarker[:lastDash]
+	}
+
+	markers := []string{longMarker}
+	shortMarkers := map[string][]string{
+		"us-phoenix-1": []string{"PHX"},
+		"us-ashburn-1": []string{"IAD", "US-ASHBURN"},
+	}
+	for _, marker := range shortMarkers[region] {
+		if marker != longMarker {
+			markers = append(markers, marker)
+		}
+	}
+	return markers
 }
 
 func waitForWorkRequest(ctx context.Context, client workrequests.WorkRequestClient, workRequestID string, pollInterval time.Duration) (workrequests.WorkRequest, error) {
@@ -925,4 +1201,13 @@ func float32Value(ptr *float32) float32 {
 		return 0
 	}
 	return *ptr
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
