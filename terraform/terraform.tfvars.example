@@ -1,0 +1,9 @@
+compartment_id      = "ocid1.compartment.oc1..example"
+availability_domain = "Uocm:US-ASHBURN-AD-1"
+config_file         = "../example.json"
+
+# Optional:
+# display_name = "cap-res-multi"
+# skip_preflight = false
+# reservation_check_interval_seconds = 30
+# validation_timeout_seconds = 1800
